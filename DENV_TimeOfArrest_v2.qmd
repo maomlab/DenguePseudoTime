@@ -1,0 +1,605 @@
+---
+title: "DENV pseudotime: inferred time of arrest"
+format: html
+---
+
+
+
+```{r packages}
+remotes::install_github("MaomLab/MPStats")
+library(MPStats)
+```
+
+```{r analysis-parameters}
+date_code <- "20260813"
+
+TIME_GRID   <- seq(from = 0, to = 48, by = 0.1)  ## CHANGED: 481 pts, was 50
+T_SCALE     <- 6      # Student-t scale, hours
+T_DF        <- 2      # Student-t degrees of freedom (heavy tails = robust)
+T_MIN       <- 0
+T_MAX       <- 48
+POOL_WEIGHT <- "normalized"  # "normalized" (w = 1/n_models) or "independent"
+```
+
+## Helper functions
+
+```{r helpers}
+## dt((x - mu)/s, df) is the density of the *standardised* variable;
+## the density of x needs the 1/s Jacobian.
+## With a single shared scale this is a constant offset for pairwise models,
+## but for one-vs-all models the offset is s-dependent and does NOT cancel.
+dt_scaled <- function(x, mu, scale, df, log = FALSE) {
+  ld <- stats::dt((x - mu) / scale, df = df, log = TRUE) - log(scale)
+  if (log) ld else exp(ld)
+}
+
+# numerically stable log(exp(la) + exp(lb))
+log_add <- function(la, lb) {
+  m <- pmax(la, lb)
+  out <- m + log(exp(la - m) + exp(lb - m))
+  out[is.infinite(m) & m < 0] <- -Inf
+  out
+}
+
+#' Log-likelihood of arrest time `x` from one pairwise model.
+#'
+#' MIXTURE, not geometric mean:  l(x|s) = (1-s) f(x; t0) + s f(x; t1)
+#' This is a proper density for every s, and its mode sits at t0 or t1.
+loglik_pairwise <- function(x, t0, t1, s, scale = T_SCALE, df = T_DF) {
+  s <- pmin(pmax(s, 0), 1)
+  log_add(
+    log(1 - s) + dt_scaled(x, t0, scale, df, log = TRUE),
+    log(s)     + dt_scaled(x, t1, scale, df, log = TRUE))
+}
+
+#' Log-likelihood of arrest time `x` from one one-vs-all model.
+#'
+#' MIXTURE of the anchored t and a uniform "no information" component:
+#'   l(x|s) = s f(x; t1) + (1-s) / (T_MAX - T_MIN)
+loglik_one_vs_all <- function(x, t1, s, scale = T_SCALE, df = T_DF,
+                              t_min = T_MIN, t_max = T_MAX) {
+  s <- pmin(pmax(s, 0), 1)
+  log_add(
+    log(s)     + dt_scaled(x, t1, scale, df, log = TRUE),
+    log(1 - s) - log(t_max - t_min))
+}
+
+#' Normalize a log-density over a uniform grid; returns density on that grid.
+normalize_log_density <- function(log_l, t) {
+  log_l <- log_l - max(log_l, na.rm = TRUE)
+  d <- exp(log_l)
+  d / (sum(d) * (t[2] - t[1]))
+}
+
+#' MAP, posterior mean and equal-tailed credible interval from a grid density.
+summarize_posterior <- function(t, density, level = 0.95) {
+  dt_ <- t[2] - t[1]
+  p   <- density * dt_
+  p   <- p / sum(p)
+  cdf <- cumsum(p)
+  a   <- (1 - level) / 2
+  tibble::tibble(
+    map      = t[which.max(density)],
+    mean     = sum(t * p),
+    sd       = sqrt(sum((t - sum(t * p))^2 * p)),
+    lower    = t[which.min(abs(cdf - a))],
+    upper    = t[which.min(abs(cdf - (1 - a)))],
+    # peak-to-trough contrast, for the "flat landscape" claim about pralatrexate
+    contrast = max(density) - min(density))
+}
+```
+
+## Load the concentration-response scores
+
+```{r load-data}
+dr_plate_map <- readr::read_csv(
+  file = here::here("src/dr_plate_map_mjo_20230724.csv"),
+  show_col_types = FALSE)
+
+DR_scored <- data.frame(
+  filename = list.files(
+    path = here::here("Jill_analysis/"),
+    pattern = "DR_scored_[^_]+_[^.]+\\.csv",
+    full.names = TRUE)) |>
+  dplyr::rowwise() |>
+  dplyr::do({
+    filename <- .$filename[1]
+    cat("Reading ", filename, "\n", sep = "")
+    readr::read_csv(file = filename, show_col_types = FALSE) |>
+      dplyr::mutate(
+        condition_1 = filename |>
+          stringr::str_extract("DR_scored_([^_]+)_([^.]+)\\.csv$", group = 1),
+        condition_2 = filename |>
+          stringr::str_extract("DR_scored_([^_]+)_([^.]+)\\.csv$", group = 2) |>
+          stringr::str_replace("vs_", ""),
+        .before = 1)
+  }) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    row    = MPStats::well_id_to_row(Image_Metadata_WellID),
+    column = MPStats::well_id_to_column(Image_Metadata_WellID),
+    .before = 7) |>
+  dplyr::left_join(
+    dr_plate_map,
+    by = c("Image_Metadata_PlateID" = "PlateID", "row", "column")) |>
+  dplyr::mutate(
+    treatment = dplyr::case_when(
+      treatment == "Nexium" ~ "Esomeprazole",
+      TRUE ~ treatment))
+
+DR_scored |>
+  readr::write_tsv(here::here(paste0("product/DR_scored_", date_code, ".tsv")))
+```
+
+```{r audit-scores}
+## XGBRegressor with squared-error loss is UNBOUNDED. check how many fall out side of [0-1]
+score_audit <- DR_scored |>
+  dplyr::summarize(
+    n          = dplyr::n(),
+    min        = min(score, na.rm = TRUE),
+    max        = max(score, na.rm = TRUE),
+    n_below_0  = sum(score < 0, na.rm = TRUE),
+    n_above_1  = sum(score > 1, na.rm = TRUE),
+    n_missing  = sum(is.na(score)))
+print(score_audit)
+
+if (score_audit$n_below_0 > 0 || score_audit$n_above_1 > 0) {
+  warning(
+    "Out-of-range XGBoost scores: ",
+    score_audit$n_below_0, " below 0, ", score_audit$n_above_1, " above 1. ",
+    "Clipping to [0, 1]. Consider retraining with binary:logistic, or ",
+    "calibrating scores (Platt / isotonic) on held-out folds.")
+}
+
+## Record how many models each well is scored under -- if any
+## well is missing a model the pooled likelihoods are not comparable.
+DR_scored |>
+  dplyr::count(Image_Metadata_PlateID, Image_Metadata_WellID,
+               name = "n_model_scores") |>
+  dplyr::count(n_model_scores) |>
+  print()
+```
+
+```{r parse-model-anchors}
+## Parse condition_1 / condition_2 into anchor times ONCE, explicitly,
+## and assert the polarity assumption instead of leaving it implicit.
+##
+## Convention assumed here (matches the filenames and Supplementary Figure 3):
+##   condition_1 = the class labelled 0, condition_2 = the class labelled 1
+##   pairwise:    "0_vs_12"   -> t0 = 0,  t1 = 12,  score -> 1 means "late"
+##   one-vs-all:  "all_vs_12" -> t0 = NA, t1 = 12,  score -> 1 means "like 12h"
+model_scores <- DR_scored |>
+  dplyr::mutate(
+    model_type = dplyr::if_else(condition_1 == "all", "one_vs_all", "pairwise"),
+    t0 = dplyr::if_else(condition_1 == "all", NA_real_,
+                        suppressWarnings(as.numeric(condition_1))),
+    t1 = suppressWarnings(as.numeric(condition_2)),
+    score = pmin(pmax(score, 0), 1),                  ## CHANGED: clip
+    model_id = paste0(condition_1, "_vs_", condition_2))
+
+stopifnot(
+  "unparsed anchor time points" =
+    !any(is.na(model_scores$t1)),
+  "pairwise models must have t0 < t1 for the 0/1 label convention to hold" =
+    all(model_scores$t0 < model_scores$t1, na.rm = TRUE))
+
+n_models <- dplyr::n_distinct(model_scores$model_id)
+message("n models = ", n_models)   # expect 21
+```
+
+## Per-well likelihood of the time of arrest
+
+```{r estimate-time-of-arrest}
+## Here: (1) pool models within a well by summing weighted log-likelihoods,
+##       (2) then summarise across replicate wells.
+pool_w <- switch(
+  POOL_WEIGHT,
+  normalized  = 1 / n_models,  # log-linear opinion pool; weights sum to 1
+  independent = 1)             # naive independence (Methods as written)
+
+well_loglik <- model_scores |>
+  dplyr::select(Image_Metadata_PlateID, Image_Metadata_WellID,
+                condition, treatment, dose_uM,
+                model_id, model_type, t0, t1, score) |>
+  tidyr::expand_grid(t = TIME_GRID) |>
+  dplyr::mutate(
+    ll = dplyr::if_else(
+      model_type == "pairwise",
+      loglik_pairwise(t, t0, t1, score),
+      loglik_one_vs_all(t, t1, score))) |>
+  dplyr::group_by(
+    Image_Metadata_PlateID, Image_Metadata_WellID,
+    condition, treatment, dose_uM, t) |>
+  dplyr::summarize(
+    ll = sum(pool_w * ll),
+    n_models_used = dplyr::n(),
+    .groups = "drop")
+
+stopifnot(all(well_loglik$n_models_used == n_models))
+
+## Normalise per well, then average the DENSITIES across replicate wells.
+well_density <- well_loglik |>
+  dplyr::group_by(Image_Metadata_PlateID, Image_Metadata_WellID,
+                  condition, treatment, dose_uM) |>
+  dplyr::mutate(density = normalize_log_density(ll, t)) |>
+  dplyr::ungroup()
+
+condition_density <- well_density |>
+  dplyr::group_by(condition, treatment, dose_uM, t) |>
+  dplyr::summarize(
+    density    = mean(density),
+    density_se = sd(density) / sqrt(dplyr::n()),   ## CHANGED: replicate error
+    n_wells    = dplyr::n(),
+    .groups = "drop")
+```
+
+```{r plot-time-of-arrest}
+plot_data_4 <- condition_density |>
+  dplyr::filter(
+    treatment %in% c("GW4064", "Esomeprazole", "Pralatrexate", "LY411575")) |>
+  dplyr::mutate(
+    treatment = factor(
+      treatment,
+      levels = c("GW4064", "Esomeprazole", "Pralatrexate", "LY411575")))
+
+plot <- ggplot2::ggplot(data = plot_data_4) +
+  ggplot2::theme_bw() +
+  ggplot2::geom_ribbon(
+    mapping = ggplot2::aes(
+      x = t,
+      ymin = density - density_se,
+      ymax = density + density_se,
+      group = dose_uM,
+      fill = log10(dose_uM)),
+    alpha = 0.2, show.legend = FALSE) +
+  ggplot2::geom_line(
+    mapping = ggplot2::aes(
+      x = t, y = density, group = dose_uM, color = log10(dose_uM)),
+    linewidth = 1.3) +
+  ggplot2::facet_wrap(facets = dplyr::vars(treatment), nrow = 1) +
+  viridis::scale_color_viridis(
+    begin = 0.1, end = 0.9,
+    breaks = c(-3, 0), labels = c("1 nM", "1 uM"), option = "plasma") +
+  viridis::scale_fill_viridis(begin = 0.1, end = 0.9, option = "plasma") +
+  ggplot2::ggtitle("Inferred time of arrest") +
+  ggplot2::labs(
+    x = "Inferred time of arrest (h)",
+    ## CHANGED: this is a probability density, not a "likelihood score" and
+    ## certainly not a percentage.
+    y = expression("Posterior density ("*h^-1*")"),
+    color = "Dose")
+plot
+
+for (ext in c("pdf", "png")) {
+  ggplot2::ggsave(
+    filename = here::here(paste0(
+      "product/inferred_time_of_arrest_", date_code, ".", ext)),
+    plot = plot, width = 7.3, height = 3)
+}
+
+condition_density |>
+  readr::write_tsv(here::here(paste0(
+    "product/inferred_time_of_arrest_", date_code, ".tsv")))
+```
+
+```{r sensitivity-to-dt-params-scale}
+## Here: (1) pool models within a well by summing weighted log-likelihoods,
+##       (2) then summarize across replicate wells.
+
+pool_w <- switch(
+  POOL_WEIGHT,
+  normalized  = 1 / n_models,  # log-linear opinion pool; weights sum to 1
+  independent = 1)             # naive independence (Methods as written)
+
+well_loglik <- tidyr::expand_grid(scale = c(3,6,9,12), df = c(2)) |>
+  dplyr::rowwise() |>
+  dplyr::rowwise() |>
+  dplyr::do({
+    params <- .
+    model_scores |>
+    dplyr::select(Image_Metadata_PlateID, Image_Metadata_WellID,
+                  condition, treatment, dose_uM,
+                  model_id, model_type, t0, t1, score) |>
+    tidyr::expand_grid(t = TIME_GRID) |>
+    dplyr::mutate(
+      ll = dplyr::if_else(
+        model_type == "pairwise",
+        loglik_pairwise(
+          t, t0, t1, score,
+          scale = params$scale[1], df = params$df[1] ),
+        loglik_one_vs_all(
+          t, t1, score,
+          scale = params$scale[1], df = params$df[1]))) |>
+    dplyr::group_by(
+      Image_Metadata_PlateID, Image_Metadata_WellID,
+      condition, treatment, dose_uM, t) |>
+    dplyr::summarize(
+      ll = sum(pool_w * ll),
+      n_models_used = dplyr::n(),
+      .groups = "drop") |>
+      dplyr::mutate(
+        scale = params$scale[1],
+        df = params$df[1],
+        .before = 1)
+  })
+
+stopifnot(all(well_loglik$n_models_used == n_models))
+
+## Normalise per well, then average the DENSITIES across replicate wells.
+well_density <- well_loglik |>
+  dplyr::group_by(
+    scale, df,
+    Image_Metadata_PlateID, Image_Metadata_WellID,
+    condition, treatment, dose_uM) |>
+  dplyr::mutate(density = normalize_log_density(ll, t)) |>
+  dplyr::ungroup()
+
+condition_density <- well_density |>
+  dplyr::group_by(
+    scale, df,
+    condition, treatment, dose_uM, t) |>
+  dplyr::summarize(
+    density    = mean(density),
+    density_se = sd(density) / sqrt(dplyr::n()),   ## CHANGED: replicate error
+    n_wells    = dplyr::n(),
+    .groups = "drop")
+
+plot_data_4 <- condition_density |>
+  dplyr::filter(
+    treatment %in% c("GW4064", "Esomeprazole", "Pralatrexate", "LY411575")) |>
+  dplyr::mutate(
+    treatment = factor(
+      treatment,
+      levels = c("GW4064", "Esomeprazole", "Pralatrexate", "LY411575")))
+
+plot <- ggplot2::ggplot(data = plot_data_4) +
+  ggplot2::theme_bw() +
+  ggplot2::geom_ribbon(
+    mapping = ggplot2::aes(
+      x = t,
+      ymin = density - density_se,
+      ymax = density + density_se,
+      group = dose_uM,
+      fill = log10(dose_uM)),
+    alpha = 0.2, show.legend = FALSE) +
+  ggplot2::geom_line(
+    mapping = ggplot2::aes(
+      x = t, y = density, group = dose_uM, color = log10(dose_uM)),
+    linewidth = 1.3) +
+  viridis::scale_color_viridis(
+    begin = 0.1, end = 0.9,
+    breaks = c(-3, 0), labels = c("1 nM", "1 uM"), option = "plasma") +
+  viridis::scale_fill_viridis(begin = 0.1, end = 0.9, option = "plasma") +
+  ggplot2::ggtitle("Inferred time of arrest", subtitle = "Sensitivity to scale") +
+  ggplot2::labs(
+    x = "Inferred time of arrest (h)",
+    y = expression("Posterior density ("*h^-1*")"),
+    color = "Dose") +
+  ggplot2::facet_grid(
+    rows = dplyr::vars(scale),
+    cols = dplyr::vars(treatment))
+plot
+
+for (ext in c("pdf", "png")) {
+  ggplot2::ggsave(
+    filename = here::here(paste0(
+      "product/inferred_time_of_arrest_scale_sensitivity_", date_code, ".", ext)),
+    plot = plot, width = 7.3, height = 6.5)
+}
+
+condition_density |>
+  readr::write_tsv(here::here(paste0(
+    "product/inferred_time_of_arrest_scale_sensitivity_", date_code, ".tsv")))
+
+```
+
+```{r sensitivity-to-dt-params-scale}
+## Here: (1) pool models within a well by summing weighted log-likelihoods,
+##       (2) then summarize across replicate wells.
+
+pool_w <- switch(
+  POOL_WEIGHT,
+  normalized  = 1 / n_models,  # log-linear opinion pool; weights sum to 1
+  independent = 1)             # naive independence (Methods as written)
+
+well_loglik <- tidyr::expand_grid(scale = c(6), df = c(1, 2, 4, Inf)) |>
+  dplyr::rowwise() |>
+  dplyr::rowwise() |>
+  dplyr::do({
+    params <- .
+    model_scores |>
+    dplyr::select(Image_Metadata_PlateID, Image_Metadata_WellID,
+                  condition, treatment, dose_uM,
+                  model_id, model_type, t0, t1, score) |>
+    tidyr::expand_grid(t = TIME_GRID) |>
+    dplyr::mutate(
+      ll = dplyr::if_else(
+        model_type == "pairwise",
+        loglik_pairwise(
+          t, t0, t1, score,
+          scale = params$scale[1], df = params$df[1] ),
+        loglik_one_vs_all(
+          t, t1, score,
+          scale = params$scale[1], df = params$df[1]))) |>
+    dplyr::group_by(
+      Image_Metadata_PlateID, Image_Metadata_WellID,
+      condition, treatment, dose_uM, t) |>
+    dplyr::summarize(
+      ll = sum(pool_w * ll),
+      n_models_used = dplyr::n(),
+      .groups = "drop") |>
+      dplyr::mutate(
+        scale = params$scale[1],
+        df = params$df[1],
+        .before = 1)
+  })
+
+## Normalize per well, then average the DENSITIES across replicate wells.
+well_density <- well_loglik |>
+  dplyr::group_by(
+    scale, df,
+    Image_Metadata_PlateID, Image_Metadata_WellID,
+    condition, treatment, dose_uM) |>
+  dplyr::mutate(density = normalize_log_density(ll, t)) |>
+  dplyr::ungroup()
+
+condition_density <- well_density |>
+  dplyr::group_by(
+    scale, df,
+    condition, treatment, dose_uM, t) |>
+  dplyr::summarize(
+    density    = mean(density),
+    density_se = sd(density) / sqrt(dplyr::n()),   ## CHANGED: replicate error
+    n_wells    = dplyr::n(),
+    .groups = "drop")
+
+plot_data_4 <- condition_density |>
+  dplyr::filter(
+    treatment %in% c("GW4064", "Esomeprazole", "Pralatrexate", "LY411575")) |>
+  dplyr::mutate(
+    treatment = factor(
+      treatment,
+      levels = c("GW4064", "Esomeprazole", "Pralatrexate", "LY411575")))
+
+plot <- ggplot2::ggplot(data = plot_data_4) +
+  ggplot2::theme_bw() +
+  ggplot2::geom_ribbon(
+    mapping = ggplot2::aes(
+      x = t,
+      ymin = density - density_se,
+      ymax = density + density_se,
+      group = dose_uM,
+      fill = log10(dose_uM)),
+    alpha = 0.2, show.legend = FALSE) +
+  ggplot2::geom_line(
+    mapping = ggplot2::aes(
+      x = t, y = density, group = dose_uM, color = log10(dose_uM)),
+    linewidth = 1.3) +
+  #ggplot2::facet_wrap(facets = dplyr::vars(treatment), nrow = 1) +
+  viridis::scale_color_viridis(
+    begin = 0.1, end = 0.9,
+    breaks = c(-3, 0), labels = c("1 nM", "1 uM"), option = "plasma") +
+  viridis::scale_fill_viridis(begin = 0.1, end = 0.9, option = "plasma") +
+  ggplot2::ggtitle("Inferred time of arrest", subtitle = "Sensitivity to DF") +
+  ggplot2::labs(
+    x = "Inferred time of arrest (h)",
+    y = expression("Posterior density ("*h^-1*")"),
+    color = "Dose") +
+  ggplot2::facet_grid(
+    rows = dplyr::vars(df),
+    cols = dplyr::vars(treatment))
+plot
+
+for (ext in c("pdf", "png")) {
+  ggplot2::ggsave(
+    filename = here::here(paste0(
+      "product/inferred_time_of_arrest_df_sensitivity_", date_code, ".", ext)),
+    plot = plot, width = 7.3, height = 6.5)
+}
+
+condition_density |>
+  readr::write_tsv(here::here(paste0(
+    "product/inferred_time_of_arrest_df_sensitivity_", date_code, ".tsv")))
+
+```
+
+
+## Point estimates with uncertainty
+
+```{r define-endpoint}
+arrest_estimates <- well_density |>
+  dplyr::group_by(Image_Metadata_PlateID, Image_Metadata_WellID,
+                  condition, treatment, dose_uM) |>
+  dplyr::reframe(summarize_posterior(t, density)) |>
+  dplyr::group_by(condition, treatment, dose_uM) |>
+  dplyr::summarize(
+    n_wells       = dplyr::n(),
+    map_median    = median(map),
+    mean_mean     = mean(mean),
+    mean_se       = sd(mean) / sqrt(dplyr::n()),
+    lower_median  = median(lower),
+    upper_median  = median(upper),
+    contrast_mean = mean(contrast),
+    ## flag boundary solutions. A MAP pinned at 0 or 48 means the
+    ## likelihood is monotone across the whole window -- i.e. "at or beyond
+    ## this edge", NOT "arrest at 0.0 h" or "arrest at 48.0 h".
+    frac_at_lower = mean(map <= T_MIN + 0.5),
+    frac_at_upper = mean(map >= T_MAX - 0.5),
+    .groups = "drop") |>
+  dplyr::mutate(
+    boundary_flag = dplyr::case_when(
+      frac_at_lower > 0.5 ~ "monotone toward t = 0 (unresolved, <= 0 h)",
+      frac_at_upper > 0.5 ~ "monotone toward t = 48 (unresolved, >= 48 h)",
+      TRUE ~ NA_character_))
+
+print(arrest_estimates, n = 50)
+
+arrest_estimates |>
+  readr::write_tsv(here::here(paste0(
+    "product/arrest_estimates_", date_code, ".tsv")))
+```
+
+```{r plot-endpoint}
+plot1 <- ggplot2::ggplot(data = arrest_estimates) +
+  ggplot2::theme_bw() +
+  ggplot2::geom_hline(yintercept = 48, linewidth = 1.1, color = "darkgray") +
+  ggplot2::geom_ribbon(
+    mapping = ggplot2::aes(
+      x = log10(dose_uM),
+      ymin = mean_mean - mean_se, ymax = mean_mean + mean_se,
+      group = treatment, fill = treatment),
+    alpha = 0.15, show.legend = FALSE) +
+  ggplot2::geom_line(
+    mapping = ggplot2::aes(
+      x = log10(dose_uM), y = mean_mean,
+      group = treatment, color = treatment),
+    linewidth = 1.5) +
+  ggplot2::scale_color_discrete(
+    "", guide = ggplot2::guide_legend(nrow = 3)) +
+  ggplot2::scale_x_continuous(
+    "Dose", breaks = -3:1,
+    labels = c("1nM", "10nM", "100nM", "1uM", "10uM")) +
+  ggplot2::scale_y_continuous(
+    "Inferred time of arrest (h)", breaks = c(0, 12, 24, 36, 48)) +
+  ggplot2::coord_cartesian(ylim = c(0, 51)) +   ## CHANGED: zoom, don't drop
+  ggplot2::theme(legend.position = "bottom")
+plot1
+
+ggplot2::ggsave(
+  plot = plot1,
+  filename = here::here(paste0("product/arrest_estimates_", date_code, ".pdf")),
+  width = 5, height = 4)
+```
+
+## Diagnostic: why mixture rather than weighted geometric mean
+
+```{r diagnostic-pooling}
+## Explore the difference between geometric and mixture pooling
+tg <- seq(0, 48, by = 0.05)
+diag_data <- tidyr::expand_grid(s = c(0, 0.25, 0.5, 0.75, 1), t = tg) |>
+  dplyr::mutate(
+    geometric = exp(
+      (1 - s) * dt_scaled(t, 12, T_SCALE, T_DF, log = TRUE) +
+      s       * dt_scaled(t, 36, T_SCALE, T_DF, log = TRUE)),
+    mixture = exp(loglik_pairwise(t, 12, 36, s))) |>
+  tidyr::pivot_longer(
+    cols = c(geometric, mixture),
+    names_to = "pooling", values_to = "density")
+
+diag_data |>
+  dplyr::group_by(pooling, s) |>
+  dplyr::summarize(
+    total_mass = sum(density) * 0.05,
+    mode_at    = t[which.max(density)],
+    .groups = "drop") |>
+  print(n = 20)
+
+ggplot2::ggplot(data = diag_data) +
+  ggplot2::theme_bw() +
+  ggplot2::geom_vline(xintercept = c(12, 36), color = "darkgray") +
+  ggplot2::geom_line(
+    mapping = ggplot2::aes(x = t, y = density, color = factor(s)),
+    linewidth = 1) +
+  ggplot2::facet_wrap(facets = dplyr::vars(pooling), scales = "free_y") +
+  ggplot2::labs(x = "t (h)", y = "density", color = "score s")
+```
