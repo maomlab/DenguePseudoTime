@@ -18,9 +18,10 @@ Jonathan Z. Sexton: jzsexton@med.umich.edu<br>
 
 ## Quickstart
 
+Follow the notebooks in the `model_training/`
+
+and then the time series analysis is in the `DENV_TimeOfArrest_v2.qmd` quarto file and can be opened and run in R after installing the package
+
     install.packages("tidyverse")
     install.packages("pak")
 	pak::pak("MaomLab/MPStats")
-
-The time series analysis is in the `DENV_TimeOfArrest_v2.qmd` quarto file and can be opened and run in R.
-
