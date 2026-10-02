@@ -1,0 +1,11 @@
+# Versions the figure notebook and 01_build_umap_table.py were last run with.
+# Newer versions should work; note that UMAP coordinates can shift slightly
+# between umap-learn / numba versions (see README).
+numpy>=2.0
+pandas>=2.2
+scipy>=1.11
+scikit-learn>=1.4
+umap-learn>=0.5.5
+matplotlib>=3.8
+seaborn>=0.13
+jupyter
